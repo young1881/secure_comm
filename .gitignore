@@ -1,0 +1,75 @@
+# 编译产物
+bin/
+obj/
+*.o
+*.a
+*.so
+*.dylib
+
+# 可执行文件
+*.exe
+*.out
+udp_client
+udp_server
+
+# 调试文件
+*.dSYM/
+core
+core.*
+*.core
+vgcore.*
+*.gdb_history
+
+# 编辑器临时文件
+*~
+*.swp
+*.swo
+*.swn
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# 系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# 日志文件
+*.log
+
+# 备份文件
+*.bak
+*.backup
+*.old
+
+# 临时文件
+*.tmp
+*.temp
+*.cache
+
+# 编译中间文件
+*.d
+*.gcda
+*.gcno
+*.gcov
+
+# 测试覆盖率报告
+coverage/
+*.gcov
+
+# 文档构建产物（如果有）
+docs/_build/
+docs/.doctrees/
+
+# 包管理（如果有）
+*.tar.gz
+*.zip
+
