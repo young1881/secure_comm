@@ -24,7 +24,7 @@ typedef struct {
 typedef struct {
     uint8_t kex_type;             // 密钥交换算法类型
     uint32_t pubkey_len;          // 公钥长度（网络字节序）
-    uint8_t pubkey[512];          // 公钥数据（PEM格式）
+    uint8_t pubkey[512];          // 公钥数据（EC_POINT未压缩格式，兼容X9.63）
 } __attribute__((packed)) kex_packet_t;
 
 // 函数声明

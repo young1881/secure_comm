@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/ec.h>
-#include <openssl/pem.h>
 #include <openssl/err.h>
 #include <openssl/sha.h>
 
@@ -86,58 +85,143 @@ int kex_generate_keypair(kex_ctx_t *ctx) {
     return 0;
 }
 
-// 导出公钥
+// 导出公钥（使用EC_POINT_point2oct未压缩格式，兼容WolfSSL X9.63）
 int kex_export_public_key(kex_ctx_t *ctx, unsigned char *pubkey, size_t *pubkey_len) {
     if (!ctx->local_keypair) {
         fprintf(stderr, "Error: Key pair not generated\n");
         return -1;
     }
     
-    BIO *bio = BIO_new(BIO_s_mem());
-    if (!bio) {
-        fprintf(stderr, "Error: Failed to create BIO\n");
+    // 获取EC_KEY
+    const EC_KEY *ec_key = EVP_PKEY_get0_EC_KEY(ctx->local_keypair);
+    if (!ec_key) {
+        fprintf(stderr, "Error: Failed to get EC_KEY from EVP_PKEY\n");
         return -1;
     }
     
-    if (PEM_write_bio_PUBKEY(bio, ctx->local_keypair) != 1) {
-        fprintf(stderr, "Error: Failed to write public key\n");
-        BIO_free(bio);
+    // 获取EC_POINT和EC_GROUP
+    const EC_POINT *pub_point = EC_KEY_get0_public_key(ec_key);
+    const EC_GROUP *group = EC_KEY_get0_group(ec_key);
+    if (!pub_point || !group) {
+        fprintf(stderr, "Error: Failed to get EC_POINT or EC_GROUP\n");
         return -1;
     }
     
-    BUF_MEM *bptr;
-    BIO_get_mem_ptr(bio, &bptr);
-    
-    if (*pubkey_len < bptr->length) {
-        *pubkey_len = bptr->length;
-        BIO_free(bio);
-        return -1;
-    }
-    
-    memcpy(pubkey, bptr->data, bptr->length);
-    *pubkey_len = bptr->length;
-    
-    BIO_free(bio);
-    return 0;
-}
-
-// 导入对端公钥
-int kex_import_peer_public_key(kex_ctx_t *ctx, const unsigned char *pubkey, size_t pubkey_len) {
-    BIO *bio = BIO_new_mem_buf(pubkey, pubkey_len);
-    if (!bio) {
-        fprintf(stderr, "Error: Failed to create BIO from buffer\n");
-        return -1;
-    }
-    
-    EVP_PKEY *peer_key = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    
-    if (!peer_key) {
-        fprintf(stderr, "Error: Failed to read peer public key\n");
+    // 计算所需的缓冲区大小（未压缩格式：1字节前缀 + 2*坐标长度）
+    size_t required_len = EC_POINT_point2oct(group, pub_point, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
+    if (required_len == 0) {
+        fprintf(stderr, "Error: Failed to calculate public key length\n");
         ERR_print_errors_fp(stderr);
         return -1;
     }
     
+    // 检查缓冲区大小
+    if (*pubkey_len < required_len) {
+        *pubkey_len = required_len;
+        fprintf(stderr, "Error: Buffer too small, need %zu bytes\n", required_len);
+        return -1;
+    }
+    
+    // 导出公钥点（未压缩格式）
+    size_t written_len = EC_POINT_point2oct(group, pub_point, POINT_CONVERSION_UNCOMPRESSED, pubkey, required_len, NULL);
+    if (written_len == 0 || written_len != required_len) {
+        fprintf(stderr, "Error: Failed to export public key\n");
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+    
+    *pubkey_len = written_len;
+    return 0;
+}
+
+// 导入对端公钥（使用EC_POINT_oct2point）
+int kex_import_peer_public_key(kex_ctx_t *ctx, const unsigned char *pubkey, size_t pubkey_len) {
+    if (!pubkey || pubkey_len == 0) {
+        fprintf(stderr, "Error: Invalid public key data\n");
+        return -1;
+    }
+    
+    // 根据kex_type确定曲线NID
+    int curve_nid;
+    size_t expected_len;
+    if (ctx->kex_type == KEX_ECDH_P256) {
+        curve_nid = NID_X9_62_prime256v1;
+        expected_len = 65; // 1 + 32 + 32 (uncompressed format)
+    } else if (ctx->kex_type == KEX_ECDH_P384) {
+        curve_nid = NID_secp384r1;
+        expected_len = 97; // 1 + 48 + 48 (uncompressed format)
+    } else {
+        fprintf(stderr, "Error: Unsupported key exchange type\n");
+        return -1;
+    }
+    
+    // 验证长度
+    if (pubkey_len != expected_len) {
+        fprintf(stderr, "Error: Invalid public key length %zu (expected %zu)\n", pubkey_len, expected_len);
+        return -1;
+    }
+    
+    // 创建EC_KEY
+    EC_KEY *ec_key = EC_KEY_new_by_curve_name(curve_nid);
+    if (!ec_key) {
+        fprintf(stderr, "Error: Failed to create EC_KEY\n");
+        return -1;
+    }
+    
+    // 获取EC_GROUP
+    const EC_GROUP *group = EC_KEY_get0_group(ec_key);
+    if (!group) {
+        fprintf(stderr, "Error: Failed to get EC_GROUP\n");
+        EC_KEY_free(ec_key);
+        return -1;
+    }
+    
+    // 创建EC_POINT
+    EC_POINT *pub_point = EC_POINT_new(group);
+    if (!pub_point) {
+        fprintf(stderr, "Error: Failed to create EC_POINT\n");
+        EC_KEY_free(ec_key);
+        return -1;
+    }
+    
+    // 从八进制格式导入点
+    if (EC_POINT_oct2point(group, pub_point, pubkey, pubkey_len, NULL) != 1) {
+        fprintf(stderr, "Error: Failed to import public key point\n");
+        ERR_print_errors_fp(stderr);
+        EC_POINT_free(pub_point);
+        EC_KEY_free(ec_key);
+        return -1;
+    }
+    
+    // 设置公钥到EC_KEY
+    if (EC_KEY_set_public_key(ec_key, pub_point) != 1) {
+        fprintf(stderr, "Error: Failed to set public key in EC_KEY\n");
+        ERR_print_errors_fp(stderr);
+        EC_POINT_free(pub_point);
+        EC_KEY_free(ec_key);
+        return -1;
+    }
+    
+    EC_POINT_free(pub_point);
+    
+    // 创建EVP_PKEY
+    EVP_PKEY *peer_key = EVP_PKEY_new();
+    if (!peer_key) {
+        fprintf(stderr, "Error: Failed to create EVP_PKEY\n");
+        EC_KEY_free(ec_key);
+        return -1;
+    }
+    
+    // 将EC_KEY设置为EVP_PKEY
+    if (EVP_PKEY_set1_EC_KEY(peer_key, ec_key) != 1) {
+        fprintf(stderr, "Error: Failed to set EC_KEY in EVP_PKEY\n");
+        ERR_print_errors_fp(stderr);
+        EC_KEY_free(ec_key);
+        EVP_PKEY_free(peer_key);
+        return -1;
+    }
+    
+    EC_KEY_free(ec_key);
     ctx->peer_public_key = peer_key;
     return 0;
 }

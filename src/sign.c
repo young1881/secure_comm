@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/bn.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
 
@@ -184,7 +186,7 @@ int sign_data(sign_ctx_t *ctx, const unsigned char *data, size_t data_len,
     return 0;
 }
 
-// 验证签名
+// 验证签名（支持Raw (R||S)格式和DER格式）
 int verify_signature(sign_ctx_t *ctx, const unsigned char *data, size_t data_len,
                      const unsigned char *signature, size_t signature_len) {
     if (!ctx->public_key) {
@@ -193,27 +195,123 @@ int verify_signature(sign_ctx_t *ctx, const unsigned char *data, size_t data_len
     }
     
     const EVP_MD *md = EVP_sha256();
+    unsigned char *der_sig = NULL;
+    size_t der_sig_len = 0;
+    const unsigned char *sig_to_verify = signature;  // 用于验证的签名指针
+    size_t sig_len_to_verify = signature_len;        // 用于验证的签名长度
+    int ret = -1;
     
+    // 确定预期的Raw签名长度（根据曲线类型）
+    size_t expected_raw_len;
+    if (ctx->sign_type == SIGN_ECDSA_P256) {
+        expected_raw_len = 64;  // 32 bytes R + 32 bytes S
+    } else if (ctx->sign_type == SIGN_ECDSA_P384) {
+        expected_raw_len = 96;  // 48 bytes R + 48 bytes S
+    } else {
+        fprintf(stderr, "Error: Unsupported signature type\n");
+        return -1;
+    }
+    
+    // 检查是否为Raw (R||S)格式签名
+    if (signature_len == expected_raw_len) {
+        // Raw格式：需要转换为DER格式
+        size_t coord_len = expected_raw_len / 2;  // R和S各占一半
+        
+        // 从Raw签名中提取R和S
+        BIGNUM *r = BN_bin2bn(signature, coord_len, NULL);
+        BIGNUM *s = BN_bin2bn(signature + coord_len, coord_len, NULL);
+        
+        if (!r || !s) {
+            fprintf(stderr, "Error: Failed to convert signature to BIGNUM\n");
+            if (r) BN_free(r);
+            if (s) BN_free(s);
+            return -1;
+        }
+        
+        // 创建ECDSA_SIG结构
+        ECDSA_SIG *sig = ECDSA_SIG_new();
+        if (!sig) {
+            fprintf(stderr, "Error: Failed to create ECDSA_SIG\n");
+            BN_free(r);
+            BN_free(s);
+            return -1;
+        }
+        
+        // 设置R和S到ECDSA_SIG（ECDSA_SIG_set0会获取所有权）
+        if (ECDSA_SIG_set0(sig, r, s) != 1) {
+            fprintf(stderr, "Error: Failed to set R and S in ECDSA_SIG\n");
+            ERR_print_errors_fp(stderr);
+            BN_free(r);
+            BN_free(s);
+            ECDSA_SIG_free(sig);
+            return -1;
+        }
+        
+        // 计算DER编码长度
+        int der_len = i2d_ECDSA_SIG(sig, NULL);
+        if (der_len <= 0) {
+            fprintf(stderr, "Error: Failed to calculate DER signature length\n");
+            ERR_print_errors_fp(stderr);
+            ECDSA_SIG_free(sig);
+            return -1;
+        }
+        
+        // 分配DER缓冲区并编码
+        der_sig = malloc(der_len);
+        if (!der_sig) {
+            fprintf(stderr, "Error: Memory allocation failed\n");
+            ECDSA_SIG_free(sig);
+            return -1;
+        }
+        
+        unsigned char *p = der_sig;
+        der_sig_len = i2d_ECDSA_SIG(sig, &p);
+        ECDSA_SIG_free(sig);
+        
+        if (der_sig_len != (size_t)der_len) {
+            fprintf(stderr, "Error: DER encoding length mismatch\n");
+            free(der_sig);
+            return -1;
+        }
+        
+        // 使用DER格式的签名进行验证
+        sig_to_verify = der_sig;
+        sig_len_to_verify = der_sig_len;
+    }
+    // 否则，假设已经是DER格式，直接使用原始签名
+    
+    // 初始化验证上下文
     if (EVP_DigestVerifyInit(ctx->verify_ctx, NULL, md, NULL, ctx->public_key) != 1) {
         fprintf(stderr, "Error: Failed to initialize verification\n");
+        if (der_sig) free(der_sig);
         return -1;
     }
     
+    // 更新验证上下文
     if (EVP_DigestVerifyUpdate(ctx->verify_ctx, data, data_len) != 1) {
         fprintf(stderr, "Error: Failed to update verification context\n");
+        if (der_sig) free(der_sig);
         return -1;
     }
     
-    int ret = EVP_DigestVerifyFinal(ctx->verify_ctx, signature, signature_len);
-    if (ret == 1) {
-        return 0;  // 验证成功
-    } else if (ret == 0) {
+    // 最终验证
+    int verify_ret = EVP_DigestVerifyFinal(ctx->verify_ctx, sig_to_verify, sig_len_to_verify);
+    if (verify_ret == 1) {
+        ret = 0;  // 验证成功
+    } else if (verify_ret == 0) {
         fprintf(stderr, "Error: Signature verification failed\n");
-        return -1;
+        ret = -1;
     } else {
         fprintf(stderr, "Error: Signature verification error\n");
         ERR_print_errors_fp(stderr);
-        return -1;
+        ret = -1;
     }
+    
+    // 清理DER签名缓冲区
+    if (der_sig) {
+        free(der_sig);
+    }
+    
+    return ret;
 }
 
