@@ -1,5 +1,6 @@
 #include "../include/cipher.h"
 #include "../include/sign.h"
+#include "../include/kex.h"
 #include "../include/network.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #define DEFAULT_CLIENT_IP "192.168.1.100"
 
 // 数据包类型
+#define PKT_TYPE_KEY_EXCHANGE 0x01
 #define PKT_TYPE_ENCRYPTED_SIGNED 0x04
 
 static void print_usage(const char *program_name) {
@@ -25,10 +27,13 @@ static void print_usage(const char *program_name) {
     fprintf(stderr, "  -p <port>       Port number (default: %d)\n", DEFAULT_PORT);
     fprintf(stderr, "  -c <cipher>     Cipher algorithm (aes128gcm, aes256gcm, aes128cbc, aes256cbc, chacha20)\n");
     fprintf(stderr, "  -s <sign>       Signature algorithm (ecdsap256, ecdsap384)\n");
-    fprintf(stderr, "  -k <key>        Encryption key (hex string, 32 bytes for AES-256, 16 bytes for AES-128)\n");
-    fprintf(stderr, "  -v <iv>         Initialization vector (hex string, 12-16 bytes)\n");
-    fprintf(stderr, "  -K <privkey>    Signature private key file (PEM format)\n");
+    fprintf(stderr, "  -x <kex>        Key exchange algorithm (ecdhp256, ecdhp384) - enables key exchange\n");
+    fprintf(stderr, "  -k <key>        Encryption key (hex string, optional if -x is used)\n");
+    fprintf(stderr, "  -v <iv>         Initialization vector (hex string, optional if -x is used)\n");
+    fprintf(stderr, "  -K <privkey>    Signature private key file (PEM format, required)\n");
     fprintf(stderr, "  -m <message>    Message to send\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Note: Either use -x for key exchange OR use -k/-v for manual key/IV\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -36,14 +41,16 @@ int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
     cipher_type_t cipher_type = CIPHER_AES_256_GCM;
     sign_type_t sign_type = SIGN_ECDSA_P256;
+    kex_type_t kex_type = KEX_ECDH_P256;
     const char *key_hex = NULL;
     const char *iv_hex = NULL;
     const char *privkey_file = NULL;
     const char *message = "Hello from secure client!";
+    int use_key_exchange = 0;
     
     // 解析命令行参数
     int opt;
-    while ((opt = getopt(argc, argv, "hi:p:c:s:k:v:K:m:")) != -1) {
+    while ((opt = getopt(argc, argv, "hi:p:c:s:x:k:v:K:m:")) != -1) {
         switch (opt) {
             case 'h':
                 print_usage(argv[0]);
@@ -80,6 +87,17 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
                 break;
+            case 'x':
+                use_key_exchange = 1;
+                if (strcmp(optarg, "ecdhp256") == 0) {
+                    kex_type = KEX_ECDH_P256;
+                } else if (strcmp(optarg, "ecdhp384") == 0) {
+                    kex_type = KEX_ECDH_P384;
+                } else {
+                    fprintf(stderr, "Unknown key exchange: %s\n", optarg);
+                    return 1;
+                }
+                break;
             case 'k':
                 key_hex = optarg;
                 break;
@@ -99,61 +117,70 @@ int main(int argc, char *argv[]) {
     }
     
     // 检查必需参数
-    if (!key_hex || !iv_hex || !privkey_file) {
-        fprintf(stderr, "Error: -k (key), -v (iv), and -K (private key file) are required\n");
+    if (!privkey_file) {
+        fprintf(stderr, "Error: -K (private key file) is required\n");
         print_usage(argv[0]);
         return 1;
+    }
+    
+    if (!use_key_exchange && (!key_hex || !iv_hex)) {
+        fprintf(stderr, "Error: Either use -x for key exchange OR provide -k (key) and -v (iv)\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    if (use_key_exchange && (key_hex || iv_hex)) {
+        fprintf(stderr, "Warning: -x (key exchange) is specified, ignoring -k and -v options\n");
     }
     
     printf("=== Secure Communication Client (Encrypt & Sign Only) ===\n");
     printf("Connecting to %s:%d\n", server_ip, port);
     printf("Cipher: %s\n", cipher_type_to_string(cipher_type));
     printf("Signature: %s\n", sign_type_to_string(sign_type));
+    if (use_key_exchange) {
+        printf("Key Exchange: %s (enabled)\n", kex_type_to_string(kex_type));
+    } else {
+        printf("Key Exchange: Disabled (using manual keys)\n");
+    }
     printf("\n");
     
-    // 解析密钥和IV
-    int key_len = cipher_get_key_len(cipher_type);
-    int iv_len = cipher_get_iv_len(cipher_type);
+    // 如果使用手动密钥，解析密钥和IV
+    unsigned char key[32] = {0};
+    unsigned char iv[16] = {0};
     
-    unsigned char key[32];
-    unsigned char iv[16];
-    
-    // 从十六进制字符串解析密钥
-    if (strlen(key_hex) != key_len * 2) {
-        fprintf(stderr, "Error: Key length mismatch. Expected %d hex characters\n", key_len * 2);
-        return 1;
-    }
-    for (int i = 0; i < key_len; i++) {
-        if (sscanf(key_hex + i * 2, "%2hhx", &key[i]) != 1) {
-            fprintf(stderr, "Error: Invalid key hex string\n");
+    if (!use_key_exchange) {
+        int key_len = cipher_get_key_len(cipher_type);
+        int iv_len = cipher_get_iv_len(cipher_type);
+        
+        // 从十六进制字符串解析密钥
+        if (strlen(key_hex) != key_len * 2) {
+            fprintf(stderr, "Error: Key length mismatch. Expected %d hex characters\n", key_len * 2);
             return 1;
         }
-    }
-    
-    // 从十六进制字符串解析IV
-    if (strlen(iv_hex) != iv_len * 2) {
-        fprintf(stderr, "Error: IV length mismatch. Expected %d hex characters\n", iv_len * 2);
-        return 1;
-    }
-    for (int i = 0; i < iv_len; i++) {
-        if (sscanf(iv_hex + i * 2, "%2hhx", &iv[i]) != 1) {
-            fprintf(stderr, "Error: Invalid IV hex string\n");
+        for (int i = 0; i < key_len; i++) {
+            if (sscanf(key_hex + i * 2, "%2hhx", &key[i]) != 1) {
+                fprintf(stderr, "Error: Invalid key hex string\n");
+                return 1;
+            }
+        }
+        
+        // 从十六进制字符串解析IV
+        if (strlen(iv_hex) != iv_len * 2) {
+            fprintf(stderr, "Error: IV length mismatch. Expected %d hex characters\n", iv_len * 2);
             return 1;
         }
-    }
-    
-    // 初始化加密上下文
-    cipher_ctx_t cipher_ctx;
-    if (cipher_ctx_init(&cipher_ctx, cipher_type, key, iv) != 0) {
-        fprintf(stderr, "Error: Failed to initialize cipher context\n");
-        return 1;
+        for (int i = 0; i < iv_len; i++) {
+            if (sscanf(iv_hex + i * 2, "%2hhx", &iv[i]) != 1) {
+                fprintf(stderr, "Error: Invalid IV hex string\n");
+                return 1;
+            }
+        }
     }
     
     // 初始化签名上下文并导入私钥
     sign_ctx_t sign_ctx;
     if (sign_ctx_init(&sign_ctx, sign_type) != 0) {
         fprintf(stderr, "Error: Failed to initialize sign context\n");
-        cipher_ctx_cleanup(&cipher_ctx);
         return 1;
     }
     
@@ -162,7 +189,6 @@ int main(int argc, char *argv[]) {
     if (!fp) {
         fprintf(stderr, "Error: Failed to open private key file: %s\n", privkey_file);
         sign_ctx_cleanup(&sign_ctx);
-        cipher_ctx_cleanup(&cipher_ctx);
         return 1;
     }
     
@@ -172,7 +198,6 @@ int main(int argc, char *argv[]) {
     if (!privkey) {
         fprintf(stderr, "Error: Failed to read private key\n");
         sign_ctx_cleanup(&sign_ctx);
-        cipher_ctx_cleanup(&cipher_ctx);
         return 1;
     }
     
@@ -182,12 +207,147 @@ int main(int argc, char *argv[]) {
     int sockfd = network_create_tcp_client_socket(server_ip, port);
     if (sockfd < 0) {
         sign_ctx_cleanup(&sign_ctx);
-        cipher_ctx_cleanup(&cipher_ctx);
         return 1;
     }
     
     printf("Connected to server\n");
-    printf("Sending message: %s\n", message);
+    
+    // 如果使用密钥交换，先进行密钥交换
+    cipher_ctx_t cipher_ctx;
+    
+    if (use_key_exchange) {
+        printf("1. Performing key exchange...\n");
+        
+        // 初始化密钥交换上下文
+        kex_ctx_t kex_ctx;
+        if (kex_ctx_init(&kex_ctx, kex_type) != 0) {
+            fprintf(stderr, "Error: Failed to initialize key exchange\n");
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        if (kex_generate_keypair(&kex_ctx) != 0) {
+            fprintf(stderr, "Error: Failed to generate key pair\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        // 导出公钥
+        unsigned char pubkey[512];
+        size_t pubkey_len = sizeof(pubkey);
+        if (kex_export_public_key(&kex_ctx, pubkey, &pubkey_len) != 0) {
+            fprintf(stderr, "Error: Failed to export public key\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        // 发送密钥交换数据包
+        uint8_t pkt_type = PKT_TYPE_KEY_EXCHANGE;
+        if (network_send_all(sockfd, &pkt_type, sizeof(pkt_type)) != 0) {
+            fprintf(stderr, "Error: Failed to send packet type\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        kex_packet_t kex_pkt;
+        memset(&kex_pkt, 0, sizeof(kex_pkt));
+        kex_pkt.kex_type = kex_type;
+        kex_pkt.pubkey_len = htonl(pubkey_len);
+        if (pubkey_len > sizeof(kex_pkt.pubkey)) {
+            fprintf(stderr, "Error: Public key too large\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        memcpy(kex_pkt.pubkey, pubkey, pubkey_len);
+        
+        if (network_send_all(sockfd, &kex_pkt, sizeof(kex_pkt)) != 0) {
+            fprintf(stderr, "Error: Failed to send public key\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        // 接收服务器公钥
+        kex_packet_t server_kex_pkt;
+        if (network_recv_all(sockfd, &server_kex_pkt, sizeof(server_kex_pkt)) != sizeof(server_kex_pkt)) {
+            fprintf(stderr, "Error: Failed to receive server public key\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        uint32_t server_pubkey_len = ntohl(server_kex_pkt.pubkey_len);
+        if (server_pubkey_len > sizeof(server_kex_pkt.pubkey)) {
+            fprintf(stderr, "Error: Server public key too large\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        if (kex_import_peer_public_key(&kex_ctx, server_kex_pkt.pubkey, server_pubkey_len) != 0) {
+            fprintf(stderr, "Error: Failed to import server public key\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        if (kex_derive_shared_secret(&kex_ctx) != 0) {
+            fprintf(stderr, "Error: Failed to derive shared secret\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        // 派生对称密钥和IV
+        int key_len = cipher_get_key_len(cipher_type);
+        int iv_len = cipher_get_iv_len(cipher_type);
+        unsigned char derived_key[32], derived_iv[16];
+        if (kex_derive_symmetric_key(&kex_ctx, key_len, iv_len, derived_key, derived_iv) != 0) {
+            fprintf(stderr, "Error: Failed to derive symmetric keys\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        printf("   ✓ Key exchange completed\n");
+        
+        // 初始化加密上下文
+        if (cipher_ctx_init(&cipher_ctx, cipher_type, derived_key, derived_iv) != 0) {
+            fprintf(stderr, "Error: Failed to initialize cipher context\n");
+            kex_ctx_cleanup(&kex_ctx);
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+        
+        kex_ctx_cleanup(&kex_ctx);
+        printf("\n2. Encrypting and sending message...\n");
+    } else {
+        // 初始化加密上下文（使用手动密钥）
+        if (cipher_ctx_init(&cipher_ctx, cipher_type, key, iv) != 0) {
+            fprintf(stderr, "Error: Failed to initialize cipher context\n");
+            sign_ctx_cleanup(&sign_ctx);
+            close(sockfd);
+            return 1;
+        }
+    }
+    
+    printf("   Message: %s\n", message);
     
     // 生成新的IV（每次加密使用新的IV）
     if (RAND_bytes(cipher_ctx.iv, cipher_ctx.iv_len) != 1) {

@@ -62,10 +62,10 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 # 服务器和客户端
-$(SERVER_BIN): $(SERVER_OBJ) $(CIPHER_OBJ) $(SIGN_OBJ) $(NETWORK_OBJ)
+$(SERVER_BIN): $(SERVER_OBJ) $(KEX_OBJ) $(CIPHER_OBJ) $(SIGN_OBJ) $(NETWORK_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(CLIENT_BIN): $(CLIENT_OBJ) $(CIPHER_OBJ) $(SIGN_OBJ) $(NETWORK_OBJ)
+$(CLIENT_BIN): $(CLIENT_OBJ) $(KEX_OBJ) $(CIPHER_OBJ) $(SIGN_OBJ) $(NETWORK_OBJ)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # 本地测试程序（不需要网络）
