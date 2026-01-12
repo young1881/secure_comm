@@ -38,9 +38,10 @@ static void print_usage(const char *program_name) {
     fprintf(stderr, "  -x <kex>        Key exchange algorithm (ecdhp256, ecdhp384) - enables key exchange\n");
     fprintf(stderr, "  -k <key>        Encryption key (hex string, optional if -x is used)\n");
     fprintf(stderr, "  -v <iv>         Initialization vector (hex string, optional if -x is used)\n");
-    fprintf(stderr, "  -K <pubkey>     Signature public key file (PEM format, required)\n");
+    fprintf(stderr, "  -K <pubkey>     Signature public key file (PEM format, optional if -x is used)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Note: Either use -x for key exchange OR use -k/-v for manual key/IV\n");
+    fprintf(stderr, "      When using -x, -K is optional (signature key will be derived from KEX)\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -120,8 +121,8 @@ int main(int argc, char *argv[]) {
     }
     
     // 检查必需参数
-    if (!pubkey_file) {
-        fprintf(stderr, "Error: -K (public key file) is required\n");
+    if (!use_key_exchange && !pubkey_file) {
+        fprintf(stderr, "Error: -K (public key file) is required when not using key exchange\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -134,6 +135,10 @@ int main(int argc, char *argv[]) {
     
     if (use_key_exchange && (key_hex || iv_hex)) {
         fprintf(stderr, "Warning: -x (key exchange) is specified, ignoring -k and -v options\n");
+    }
+    
+    if (use_key_exchange && !pubkey_file) {
+        printf("Note: Using key exchange mode - signature key will be derived from KEX session\n");
     }
     
     signal(SIGINT, signal_handler);
@@ -204,47 +209,50 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // 从文件读取公钥
-    FILE *fp = fopen(pubkey_file, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Failed to open public key file: %s\n", pubkey_file);
-        sign_ctx_cleanup(&sign_ctx);
-        if (cipher_ctx_ptr) {
-            cipher_ctx_cleanup(cipher_ctx_ptr);
+    // 从文件读取公钥（如果提供了 -K 参数）
+    // 如果使用密钥交换模式且未提供 -K，则跳过文件加载，将在密钥交换后自动设置
+    if (pubkey_file) {
+        FILE *fp = fopen(pubkey_file, "r");
+        if (!fp) {
+            fprintf(stderr, "Error: Failed to open public key file: %s\n", pubkey_file);
+            sign_ctx_cleanup(&sign_ctx);
+            if (cipher_ctx_ptr) {
+                cipher_ctx_cleanup(cipher_ctx_ptr);
+            }
+            return 1;
         }
-        return 1;
-    }
-    
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    unsigned char *pubkey_data = malloc(file_size + 1);
-    if (!pubkey_data) {
-        fprintf(stderr, "Error: Memory allocation failed\n");
+        
+        fseek(fp, 0, SEEK_END);
+        long file_size = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        
+        unsigned char *pubkey_data = malloc(file_size + 1);
+        if (!pubkey_data) {
+            fprintf(stderr, "Error: Memory allocation failed\n");
+            fclose(fp);
+            sign_ctx_cleanup(&sign_ctx);
+            if (cipher_ctx_ptr) {
+                cipher_ctx_cleanup(cipher_ctx_ptr);
+            }
+            return 1;
+        }
+        
+        size_t read_size = fread(pubkey_data, 1, file_size, fp);
         fclose(fp);
-        sign_ctx_cleanup(&sign_ctx);
-        if (cipher_ctx_ptr) {
-            cipher_ctx_cleanup(cipher_ctx_ptr);
+        pubkey_data[read_size] = '\0';
+        
+        if (sign_import_peer_public_key(&sign_ctx, pubkey_data, read_size) != 0) {
+            fprintf(stderr, "Error: Failed to import public key\n");
+            free(pubkey_data);
+            sign_ctx_cleanup(&sign_ctx);
+            if (cipher_ctx_ptr) {
+                cipher_ctx_cleanup(cipher_ctx_ptr);
+            }
+            return 1;
         }
-        return 1;
-    }
-    
-    size_t read_size = fread(pubkey_data, 1, file_size, fp);
-    fclose(fp);
-    pubkey_data[read_size] = '\0';
-    
-    if (sign_import_peer_public_key(&sign_ctx, pubkey_data, read_size) != 0) {
-        fprintf(stderr, "Error: Failed to import public key\n");
+        
         free(pubkey_data);
-        sign_ctx_cleanup(&sign_ctx);
-        if (cipher_ctx_ptr) {
-            cipher_ctx_cleanup(cipher_ctx_ptr);
-        }
-        return 1;
     }
-    
-    free(pubkey_data);
     
     printf("=== Ready for secure communication ===\n\n");
     
@@ -387,6 +395,26 @@ int main(int argc, char *argv[]) {
             }
             
             printf("   ✓ Key exchange completed\n");
+            
+            /* ================= [新增代码 START] ================= */
+            /* 关键修复：TC397 使用同一个随机密钥进行 KEX 和 签名。
+             * 因此，我们需要将 KEX 阶段收到的公钥，复制给签名上下文，
+             * 否则服务器加载的静态 -K 公钥无法验证 TC397 的动态签名。
+             */
+            if (sign_ctx.public_key) {
+                EVP_PKEY_free(sign_ctx.public_key);
+            }
+            // 将 KEX 获得的对端公钥复制给 签名上下文
+            sign_ctx.public_key = EVP_PKEY_dup(kex_ctx.peer_public_key);
+            if (!sign_ctx.public_key) {
+                fprintf(stderr, "Error: Failed to duplicate KEX public key for signature verification\n");
+                kex_ctx_cleanup(&kex_ctx);
+                close(client_fd);
+                continue;
+            }
+            
+            printf("   ! Updated signature verification key from KEX session\n");
+            /* ================= [新增代码 END] ==================== */
             
             // 初始化加密上下文
             if (cipher_ctx_init(&cipher_ctx_dynamic, cipher_type, derived_key, derived_iv) != 0) {
