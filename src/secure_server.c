@@ -427,106 +427,141 @@ int main(int argc, char *argv[]) {
             current_cipher_ctx = &cipher_ctx_dynamic;
             kex_ctx_cleanup(&kex_ctx);
             printf("\n2. Ready to receive encrypted messages...\n");
+        } else {
+            printf("\n2. Ready to receive encrypted messages (manual key mode)...\n");
         }
         
         // 通信循环
         unsigned char buffer[MAX_BUFFER_SIZE];
+        int packet_count = 0;
+        printf("[DEBUG] Entering receive loop, waiting for packet type (0x%02x = ENCRYPTED_SIGNED)...\n", PKT_TYPE_ENCRYPTED_SIGNED);
         while (running) {
             // 接收数据包类型
             uint8_t pkt_type;
-            if (network_recv_all_timeout(client_fd, &pkt_type, sizeof(pkt_type), 5000) != sizeof(pkt_type)) {
+            printf("[DEBUG] Waiting for packet type (timeout: 5s)...\n");
+            ssize_t recv_result = network_recv_all_timeout(client_fd, &pkt_type, sizeof(pkt_type), 5000);
+            if (recv_result != sizeof(pkt_type)) {
                 if (errno == ETIMEDOUT || errno == 0) {
+                    printf("[DEBUG] Timeout waiting for packet type, continuing...\n");
                     continue;
                 }
-                printf("Client disconnected or error occurred\n");
+                printf("[ERROR] Client disconnected or error occurred (recv_result=%zd, errno=%d)\n", recv_result, errno);
                 break;
             }
             
+            printf("[DEBUG] Received packet type: 0x%02x\n", pkt_type);
+            
             if (pkt_type == PKT_TYPE_ENCRYPTED_SIGNED) {
+                packet_count++;
+                printf("[DEBUG] Processing ENCRYPTED_SIGNED packet #%d...\n", packet_count);
+                
                 // 接收加密数据包头
+                printf("[DEBUG] Receiving encrypted packet header...\n");
                 encrypted_packet_t enc_pkt;
-                if (network_recv_all(client_fd, &enc_pkt.cipher_type, 
-                            sizeof(enc_pkt) - offsetof(encrypted_packet_t, cipher_type)) != 
-                    sizeof(enc_pkt) - offsetof(encrypted_packet_t, cipher_type)) {
-                    printf("Error: Failed to receive encrypted packet header\n");
+                ssize_t header_size = sizeof(enc_pkt) - offsetof(encrypted_packet_t, cipher_type);
+                if (network_recv_all(client_fd, &enc_pkt.cipher_type, header_size) != header_size) {
+                    printf("[ERROR] Failed to receive encrypted packet header\n");
                     break;
                 }
                 
                 uint32_t data_len = ntohl(enc_pkt.data_len);
                 uint32_t iv_len = ntohl(enc_pkt.iv_len);
                 uint32_t tag_len = ntohl(enc_pkt.tag_len);
+                printf("[DEBUG] Encrypted packet info: data_len=%u, iv_len=%u, tag_len=%u\n", 
+                       data_len, iv_len, tag_len);
                 
                 if (data_len > MAX_BUFFER_SIZE || iv_len > sizeof(enc_pkt.iv) || tag_len > sizeof(enc_pkt.tag)) {
-                    printf("Error: Invalid packet size\n");
+                    printf("[ERROR] Invalid packet size (data_len=%u, iv_len=%u, tag_len=%u)\n", 
+                           data_len, iv_len, tag_len);
                     break;
                 }
                 
                 // 接收加密数据
+                printf("[DEBUG] Receiving encrypted data (%u bytes)...\n", data_len);
                 unsigned char *encrypted_data = buffer;
                 if (network_recv_all(client_fd, encrypted_data, data_len) != data_len) {
-                    printf("Error: Failed to receive encrypted data\n");
+                    printf("[ERROR] Failed to receive encrypted data\n");
                     break;
                 }
+                printf("[DEBUG] Encrypted data received successfully\n");
                 
                 // 接收签名数据包头
+                printf("[DEBUG] Receiving signature packet header...\n");
                 signed_packet_t sig_pkt;
                 if (network_recv_all(client_fd, &sig_pkt.sign_type, sizeof(sig_pkt.sign_type)) != sizeof(sig_pkt.sign_type)) {
-                    printf("Error: Failed to receive signature packet type\n");
+                    printf("[ERROR] Failed to receive signature packet type\n");
                     break;
                 }
+                printf("[DEBUG] Signature type: 0x%02x\n", sig_pkt.sign_type);
                 
                 if (network_recv_all(client_fd, &sig_pkt.data_len, sizeof(sig_pkt.data_len)) != sizeof(sig_pkt.data_len)) {
-                    printf("Error: Failed to receive signature data length\n");
+                    printf("[ERROR] Failed to receive signature data length\n");
                     break;
                 }
                 
                 uint32_t sig_data_len = ntohl(sig_pkt.data_len);
+                printf("[DEBUG] Signature data length: %u bytes\n", sig_data_len);
+                
                 if (network_recv_all(client_fd, &sig_pkt.sig_len, sizeof(sig_pkt.sig_len)) != sizeof(sig_pkt.sig_len)) {
-                    printf("Error: Failed to receive signature length\n");
+                    printf("[ERROR] Failed to receive signature length\n");
                     break;
                 }
                 
                 uint32_t sig_len = ntohl(sig_pkt.sig_len);
+                printf("[DEBUG] Signature length: %u bytes\n", sig_len);
+                
                 if (sig_len > MAX_BUFFER_SIZE) {
-                    printf("Error: Signature too large\n");
+                    printf("[ERROR] Signature too large (%u > %d)\n", sig_len, MAX_BUFFER_SIZE);
                     break;
                 }
                 
                 // 接收签名数据（加密数据+标签）
+                printf("[DEBUG] Receiving signature data (%u bytes)...\n", sig_data_len);
                 unsigned char *sig_data = buffer + MAX_BUFFER_SIZE / 2;
                 if (network_recv_all(client_fd, sig_data, sig_data_len) != sig_data_len) {
-                    printf("Error: Failed to receive signature data\n");
+                    printf("[ERROR] Failed to receive signature data\n");
                     break;
                 }
+                printf("[DEBUG] Signature data received successfully\n");
                 
+                printf("[DEBUG] Receiving signature (%u bytes)...\n", sig_len);
                 unsigned char *signature = sig_data + sig_data_len;
                 if (network_recv_all(client_fd, signature, sig_len) != sig_len) {
-                    printf("Error: Failed to receive signature\n");
+                    printf("[ERROR] Failed to receive signature\n");
                     break;
                 }
+                printf("[DEBUG] Signature received successfully\n");
                 
                 // 验证签名
+                printf("[DEBUG] Verifying signature...\n");
                 if (verify_signature(&sign_ctx, sig_data, sig_data_len, signature, sig_len) != 0) {
-                    printf("Error: Signature verification failed!\n");
+                    printf("[ERROR] Signature verification failed!\n");
                     break;
                 }
                 
                 printf("Signature verified successfully!\n");
                 
                 // 更新IV（使用接收到的IV）
+                printf("[DEBUG] Updating IV (%u bytes)...\n", iv_len);
                 memcpy(current_cipher_ctx->iv, enc_pkt.iv, iv_len);
                 
                 // 解密数据
+                printf("[DEBUG] Decrypting data (%u bytes)...\n", data_len);
                 unsigned char *plaintext = buffer + MAX_BUFFER_SIZE / 2;
                 size_t plaintext_len = MAX_BUFFER_SIZE / 2;
                 if (cipher_decrypt(current_cipher_ctx, encrypted_data, data_len, enc_pkt.tag, plaintext, &plaintext_len) != 0) {
-                    printf("Error: Decryption failed!\n");
+                    printf("[ERROR] Decryption failed!\n");
                     break;
                 }
                 
+                printf("[DEBUG] Decryption successful, plaintext length: %zu bytes\n", plaintext_len);
                 printf("Received encrypted and signed message (%zu bytes):\n", plaintext_len);
                 printf("  %.*s\n", (int)plaintext_len, plaintext);
                 printf("\n");
+                printf("[DEBUG] Waiting for next packet...\n");
+            } else {
+                printf("[WARNING] Received unexpected packet type: 0x%02x (expected 0x%02x), ignoring...\n", 
+                       pkt_type, PKT_TYPE_ENCRYPTED_SIGNED);
             }
         }
         
