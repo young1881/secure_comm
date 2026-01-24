@@ -1,6 +1,4 @@
-#include "../include/cipher.h"
-#include "../include/sign.h"
-#include "../include/kex.h"
+#include "../include/secure_protocol.h"
 #include "../include/network.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,17 +6,11 @@
 #include <unistd.h>
 #include <signal.h>
 #include <arpa/inet.h>
-#include <stddef.h>
 #include <errno.h>
 
-#define MAX_BUFFER_SIZE 65507
 #define DEFAULT_PORT 8888
 #define DEFAULT_SERVER_IP "0.0.0.0"
 #define DEFAULT_BACKLOG 5
-
-// 数据包类型
-#define PKT_TYPE_KEY_EXCHANGE 0x01
-#define PKT_TYPE_ENCRYPTED_SIGNED 0x04
 
 static volatile int running = 1;
 
@@ -42,6 +34,38 @@ static void print_usage(const char *program_name) {
     fprintf(stderr, "\n");
     fprintf(stderr, "Note: Either use -x for key exchange OR use -k/-v for manual key/IV\n");
     fprintf(stderr, "      When using -x, -K is optional (signature key will be derived from KEX)\n");
+}
+
+static int load_public_key_file(const char *pubkey_file, sign_ctx_t *sign_ctx) {
+    FILE *fp = fopen(pubkey_file, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Failed to open public key file: %s\n", pubkey_file);
+        return -1;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    unsigned char *pubkey_data = malloc(file_size + 1);
+    if (!pubkey_data) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        fclose(fp);
+        return -1;
+    }
+
+    size_t read_size = fread(pubkey_data, 1, file_size, fp);
+    fclose(fp);
+    pubkey_data[read_size] = '\0';
+
+    if (sign_import_peer_public_key(sign_ctx, pubkey_data, read_size) != 0) {
+        fprintf(stderr, "Error: Failed to import public key\n");
+        free(pubkey_data);
+        return -1;
+    }
+
+    free(pubkey_data);
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -188,81 +212,11 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // 初始化加密上下文（如果使用手动密钥）
-    cipher_ctx_t *cipher_ctx_ptr = NULL;
-    cipher_ctx_t cipher_ctx_static;
-    if (!use_key_exchange) {
-        if (cipher_ctx_init(&cipher_ctx_static, cipher_type, key, iv) != 0) {
-            fprintf(stderr, "Error: Failed to initialize cipher context\n");
-            return 1;
-        }
-        cipher_ctx_ptr = &cipher_ctx_static;
-    }
-    
-    // 初始化签名上下文并导入公钥
-    sign_ctx_t sign_ctx;
-    if (sign_ctx_init(&sign_ctx, sign_type) != 0) {
-        fprintf(stderr, "Error: Failed to initialize sign context\n");
-        if (cipher_ctx_ptr) {
-            cipher_ctx_cleanup(cipher_ctx_ptr);
-        }
-        return 1;
-    }
-    
-    // 从文件读取公钥（如果提供了 -K 参数）
-    // 如果使用密钥交换模式且未提供 -K，则跳过文件加载，将在密钥交换后自动设置
-    if (pubkey_file) {
-        FILE *fp = fopen(pubkey_file, "r");
-        if (!fp) {
-            fprintf(stderr, "Error: Failed to open public key file: %s\n", pubkey_file);
-            sign_ctx_cleanup(&sign_ctx);
-            if (cipher_ctx_ptr) {
-                cipher_ctx_cleanup(cipher_ctx_ptr);
-            }
-            return 1;
-        }
-        
-        fseek(fp, 0, SEEK_END);
-        long file_size = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        
-        unsigned char *pubkey_data = malloc(file_size + 1);
-        if (!pubkey_data) {
-            fprintf(stderr, "Error: Memory allocation failed\n");
-            fclose(fp);
-            sign_ctx_cleanup(&sign_ctx);
-            if (cipher_ctx_ptr) {
-                cipher_ctx_cleanup(cipher_ctx_ptr);
-            }
-            return 1;
-        }
-        
-        size_t read_size = fread(pubkey_data, 1, file_size, fp);
-        fclose(fp);
-        pubkey_data[read_size] = '\0';
-        
-        if (sign_import_peer_public_key(&sign_ctx, pubkey_data, read_size) != 0) {
-            fprintf(stderr, "Error: Failed to import public key\n");
-            free(pubkey_data);
-            sign_ctx_cleanup(&sign_ctx);
-            if (cipher_ctx_ptr) {
-                cipher_ctx_cleanup(cipher_ctx_ptr);
-            }
-            return 1;
-        }
-        
-        free(pubkey_data);
-    }
-    
     printf("=== Ready for secure communication ===\n\n");
     
     // 创建服务器socket
     int server_fd = network_create_tcp_server_socket(server_ip, port, DEFAULT_BACKLOG);
     if (server_fd < 0) {
-        sign_ctx_cleanup(&sign_ctx);
-        if (cipher_ctx_ptr) {
-            cipher_ctx_cleanup(cipher_ctx_ptr);
-        }
         return 1;
     }
     
@@ -284,300 +238,59 @@ int main(int argc, char *argv[]) {
         printf("\nClient connected from %s:%d\n", 
                inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         
-        // 如果使用密钥交换，先进行密钥交换
-        cipher_ctx_t *current_cipher_ctx = cipher_ctx_ptr;
-        cipher_ctx_t cipher_ctx_dynamic;
-        
+        secure_session_t session;
+        if (sp_session_init(&session, client_fd, kex_type, cipher_type, sign_type) != 0) {
+            fprintf(stderr, "Error: Failed to initialize protocol session\n");
+            close(client_fd);
+            continue;
+        }
+
+        if (pubkey_file) {
+            if (load_public_key_file(pubkey_file, &session.sign) != 0) {
+                sp_session_cleanup(&session);
+                close(client_fd);
+                continue;
+            }
+        }
+
         if (use_key_exchange) {
             printf("1. Performing key exchange...\n");
-            
-            // 初始化密钥交换上下文
-            kex_ctx_t kex_ctx;
-            if (kex_ctx_init(&kex_ctx, kex_type) != 0) {
-                fprintf(stderr, "Error: Failed to initialize key exchange\n");
+            if (sp_server_handshake(&session) != 0) {
+                fprintf(stderr, "Error: Handshake failed\n");
+                sp_session_cleanup(&session);
                 close(client_fd);
                 continue;
             }
-            
-            if (kex_generate_keypair(&kex_ctx) != 0) {
-                fprintf(stderr, "Error: Failed to generate key pair\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            // 接收客户端密钥交换请求
-            uint8_t pkt_type;
-            if (network_recv_all(client_fd, &pkt_type, sizeof(pkt_type)) != sizeof(pkt_type)) {
-                fprintf(stderr, "Error: Failed to receive packet type\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            if (pkt_type != PKT_TYPE_KEY_EXCHANGE) {
-                fprintf(stderr, "Error: Expected key exchange packet, got 0x%02x\n", pkt_type);
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            kex_packet_t client_kex_pkt;
-            if (network_recv_all(client_fd, &client_kex_pkt, sizeof(client_kex_pkt)) != sizeof(client_kex_pkt)) {
-                fprintf(stderr, "Error: Failed to receive client public key\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            uint32_t client_pubkey_len = ntohl(client_kex_pkt.pubkey_len);
-            if (client_pubkey_len > sizeof(client_kex_pkt.pubkey)) {
-                fprintf(stderr, "Error: Client public key too large\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            if (kex_import_peer_public_key(&kex_ctx, client_kex_pkt.pubkey, client_pubkey_len) != 0) {
-                fprintf(stderr, "Error: Failed to import client public key\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            // 导出服务器公钥
-            unsigned char server_pubkey[512];
-            size_t server_pubkey_len = sizeof(server_pubkey);
-            if (kex_export_public_key(&kex_ctx, server_pubkey, &server_pubkey_len) != 0) {
-                fprintf(stderr, "Error: Failed to export server public key\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            // 发送服务器公钥
-            kex_packet_t server_kex_pkt;
-            memset(&server_kex_pkt, 0, sizeof(server_kex_pkt));
-            server_kex_pkt.kex_type = kex_type;
-            server_kex_pkt.pubkey_len = htonl(server_pubkey_len);
-            if (server_pubkey_len > sizeof(server_kex_pkt.pubkey)) {
-                fprintf(stderr, "Error: Server public key too large\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            memcpy(server_kex_pkt.pubkey, server_pubkey, server_pubkey_len);
-            
-            if (network_send_all(client_fd, &server_kex_pkt, sizeof(server_kex_pkt)) != 0) {
-                fprintf(stderr, "Error: Failed to send server public key\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            // 派生共享密钥
-            if (kex_derive_shared_secret(&kex_ctx) != 0) {
-                fprintf(stderr, "Error: Failed to derive shared secret\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            // 派生对称密钥和IV
-            int key_len = cipher_get_key_len(cipher_type);
-            int iv_len = cipher_get_iv_len(cipher_type);
-            unsigned char derived_key[32], derived_iv[16];
-            if (kex_derive_symmetric_key(&kex_ctx, key_len, iv_len, derived_key, derived_iv) != 0) {
-                fprintf(stderr, "Error: Failed to derive symmetric keys\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            printf("   ✓ Key exchange completed\n");
-            
-            /* ================= [新增代码 START] ================= */
-            /* 关键修复：TC397 使用同一个随机密钥进行 KEX 和 签名。
-             * 因此，我们需要将 KEX 阶段收到的公钥，复制给签名上下文，
-             * 否则服务器加载的静态 -K 公钥无法验证 TC397 的动态签名。
-             */
-            if (sign_ctx.public_key) {
-                EVP_PKEY_free(sign_ctx.public_key);
-            }
-            // 将 KEX 获得的对端公钥复制给 签名上下文
-            sign_ctx.public_key = EVP_PKEY_dup(kex_ctx.peer_public_key);
-            if (!sign_ctx.public_key) {
-                fprintf(stderr, "Error: Failed to duplicate KEX public key for signature verification\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            printf("   ! Updated signature verification key from KEX session\n");
-            /* ================= [新增代码 END] ==================== */
-            
-            // 初始化加密上下文
-            if (cipher_ctx_init(&cipher_ctx_dynamic, cipher_type, derived_key, derived_iv) != 0) {
-                fprintf(stderr, "Error: Failed to initialize cipher context\n");
-                kex_ctx_cleanup(&kex_ctx);
-                close(client_fd);
-                continue;
-            }
-            
-            current_cipher_ctx = &cipher_ctx_dynamic;
-            kex_ctx_cleanup(&kex_ctx);
             printf("\n2. Ready to receive encrypted messages...\n");
         } else {
+            if (cipher_ctx_init(&session.cipher, cipher_type, key, iv) != 0) {
+                fprintf(stderr, "Error: Failed to initialize cipher context\n");
+                sp_session_cleanup(&session);
+                close(client_fd);
+                continue;
+            }
+            session.is_handshake_done = 1;
             printf("\n2. Ready to receive encrypted messages (manual key mode)...\n");
         }
-        
-        // 通信循环
-        unsigned char buffer[MAX_BUFFER_SIZE];
-        int packet_count = 0;
-        printf("[DEBUG] Entering receive loop, waiting for packet type (0x%02x = ENCRYPTED_SIGNED)...\n", PKT_TYPE_ENCRYPTED_SIGNED);
+
         while (running) {
-            // 接收数据包类型
-            uint8_t pkt_type;
-            printf("[DEBUG] Waiting for packet type (timeout: 5s)...\n");
-            ssize_t recv_result = network_recv_all_timeout(client_fd, &pkt_type, sizeof(pkt_type), 5000);
-            if (recv_result != sizeof(pkt_type)) {
-                if (errno == ETIMEDOUT || errno == 0) {
-                    printf("[DEBUG] Timeout waiting for packet type, continuing...\n");
-                    continue;
-                }
-                printf("[ERROR] Client disconnected or error occurred (recv_result=%zd, errno=%d)\n", recv_result, errno);
+            unsigned char *plaintext = NULL;
+            size_t plaintext_len = 0;
+            if (sp_server_recv_msg(&session, &plaintext, &plaintext_len) != 0) {
+                free(plaintext);
                 break;
             }
-            
-            printf("[DEBUG] Received packet type: 0x%02x\n", pkt_type);
-            
-            if (pkt_type == PKT_TYPE_ENCRYPTED_SIGNED) {
-                packet_count++;
-                printf("[DEBUG] Processing ENCRYPTED_SIGNED packet #%d...\n", packet_count);
-                
-                // 接收加密数据包头
-                printf("[DEBUG] Receiving encrypted packet header...\n");
-                encrypted_packet_t enc_pkt;
-                ssize_t header_size = sizeof(enc_pkt) - offsetof(encrypted_packet_t, cipher_type);
-                if (network_recv_all(client_fd, &enc_pkt.cipher_type, header_size) != header_size) {
-                    printf("[ERROR] Failed to receive encrypted packet header\n");
-                    break;
-                }
-                
-                uint32_t data_len = ntohl(enc_pkt.data_len);
-                uint32_t iv_len = ntohl(enc_pkt.iv_len);
-                uint32_t tag_len = ntohl(enc_pkt.tag_len);
-                printf("[DEBUG] Encrypted packet info: data_len=%u, iv_len=%u, tag_len=%u\n", 
-                       data_len, iv_len, tag_len);
-                
-                if (data_len > MAX_BUFFER_SIZE || iv_len > sizeof(enc_pkt.iv) || tag_len > sizeof(enc_pkt.tag)) {
-                    printf("[ERROR] Invalid packet size (data_len=%u, iv_len=%u, tag_len=%u)\n", 
-                           data_len, iv_len, tag_len);
-                    break;
-                }
-                
-                // 接收加密数据
-                printf("[DEBUG] Receiving encrypted data (%u bytes)...\n", data_len);
-                unsigned char *encrypted_data = buffer;
-                if (network_recv_all(client_fd, encrypted_data, data_len) != data_len) {
-                    printf("[ERROR] Failed to receive encrypted data\n");
-                    break;
-                }
-                printf("[DEBUG] Encrypted data received successfully\n");
-                
-                // 接收签名数据包头
-                printf("[DEBUG] Receiving signature packet header...\n");
-                signed_packet_t sig_pkt;
-                if (network_recv_all(client_fd, &sig_pkt.sign_type, sizeof(sig_pkt.sign_type)) != sizeof(sig_pkt.sign_type)) {
-                    printf("[ERROR] Failed to receive signature packet type\n");
-                    break;
-                }
-                printf("[DEBUG] Signature type: 0x%02x\n", sig_pkt.sign_type);
-                
-                if (network_recv_all(client_fd, &sig_pkt.data_len, sizeof(sig_pkt.data_len)) != sizeof(sig_pkt.data_len)) {
-                    printf("[ERROR] Failed to receive signature data length\n");
-                    break;
-                }
-                
-                uint32_t sig_data_len = ntohl(sig_pkt.data_len);
-                printf("[DEBUG] Signature data length: %u bytes\n", sig_data_len);
-                
-                if (network_recv_all(client_fd, &sig_pkt.sig_len, sizeof(sig_pkt.sig_len)) != sizeof(sig_pkt.sig_len)) {
-                    printf("[ERROR] Failed to receive signature length\n");
-                    break;
-                }
-                
-                uint32_t sig_len = ntohl(sig_pkt.sig_len);
-                printf("[DEBUG] Signature length: %u bytes\n", sig_len);
-                
-                if (sig_len > MAX_BUFFER_SIZE) {
-                    printf("[ERROR] Signature too large (%u > %d)\n", sig_len, MAX_BUFFER_SIZE);
-                    break;
-                }
-                
-                // 接收签名数据（加密数据+标签）
-                printf("[DEBUG] Receiving signature data (%u bytes)...\n", sig_data_len);
-                unsigned char *sig_data = buffer + MAX_BUFFER_SIZE / 2;
-                if (network_recv_all(client_fd, sig_data, sig_data_len) != sig_data_len) {
-                    printf("[ERROR] Failed to receive signature data\n");
-                    break;
-                }
-                printf("[DEBUG] Signature data received successfully\n");
-                
-                printf("[DEBUG] Receiving signature (%u bytes)...\n", sig_len);
-                unsigned char *signature = sig_data + sig_data_len;
-                if (network_recv_all(client_fd, signature, sig_len) != sig_len) {
-                    printf("[ERROR] Failed to receive signature\n");
-                    break;
-                }
-                printf("[DEBUG] Signature received successfully\n");
-                
-                // 验证签名
-                printf("[DEBUG] Verifying signature...\n");
-                if (verify_signature(&sign_ctx, sig_data, sig_data_len, signature, sig_len) != 0) {
-                    printf("[ERROR] Signature verification failed!\n");
-                    break;
-                }
-                
-                printf("Signature verified successfully!\n");
-                
-                // 更新IV（使用接收到的IV）
-                printf("[DEBUG] Updating IV (%u bytes)...\n", iv_len);
-                memcpy(current_cipher_ctx->iv, enc_pkt.iv, iv_len);
-                
-                // 解密数据
-                printf("[DEBUG] Decrypting data (%u bytes)...\n", data_len);
-                unsigned char *plaintext = buffer + MAX_BUFFER_SIZE / 2;
-                size_t plaintext_len = MAX_BUFFER_SIZE / 2;
-                if (cipher_decrypt(current_cipher_ctx, encrypted_data, data_len, enc_pkt.tag, plaintext, &plaintext_len) != 0) {
-                    printf("[ERROR] Decryption failed!\n");
-                    break;
-                }
-                
-                printf("[DEBUG] Decryption successful, plaintext length: %zu bytes\n", plaintext_len);
-                printf("Received encrypted and signed message (%zu bytes):\n", plaintext_len);
-                printf("  %.*s\n", (int)plaintext_len, plaintext);
-                printf("\n");
-                printf("[DEBUG] Waiting for next packet...\n");
-            } else {
-                printf("[WARNING] Received unexpected packet type: 0x%02x (expected 0x%02x), ignoring...\n", 
-                       pkt_type, PKT_TYPE_ENCRYPTED_SIGNED);
-            }
+
+            printf("Received encrypted and signed message (%zu bytes):\n", plaintext_len);
+            printf("  %.*s\n\n", (int)plaintext_len, plaintext);
+            free(plaintext);
         }
-        
-        // 清理动态分配的加密上下文
-        if (use_key_exchange && current_cipher_ctx == &cipher_ctx_dynamic) {
-            cipher_ctx_cleanup(&cipher_ctx_dynamic);
-        }
-        
+
+        sp_session_cleanup(&session);
         close(client_fd);
         printf("Client disconnected\n");
     }
     
-    sign_ctx_cleanup(&sign_ctx);
-    if (cipher_ctx_ptr) {
-        cipher_ctx_cleanup(cipher_ctx_ptr);
-    }
     close(server_fd);
     return 0;
 }
